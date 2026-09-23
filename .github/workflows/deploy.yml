@@ -9,14 +9,173 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REGISTRY: ghcr.io
   IMAGE_BACKEND: ghcr.io/ebadzmn/cashflow-backend
   IMAGE_ADMIN: ghcr.io/ebadzmn/cashflow-admin
   TAG: ${{ github.sha }}
 
 jobs:
   # ─────────────────────────────────────────────────────────────────
-  # JOB 1: TypeScript type-check (both apps in parallel)
+  # JOB 0: Bootstrap EC2 server (idempotent — safe to run every push)
+  # Installs swap, Docker, Nginx, MongoDB, backup cron on first run.
+  # Skips everything already done on subsequent pushes.
+  # ─────────────────────────────────────────────────────────────────
+  setup-server:
+    name: 🖥️ Bootstrap EC2 Server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bootstrap server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 15m
+          script: |
+            set -e
+
+            # ── Swap file (only if not already set up) ────────────────
+            if ! swapon --show | grep -q swapfile; then
+              echo "Setting up 2GB swap file..."
+              sudo fallocate -l 2G /swapfile
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+              sudo swapon /swapfile
+              echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+              echo "✅ Swap file created"
+            else
+              echo "✅ Swap file already exists — skipping"
+            fi
+
+            # ── Docker (only if not installed) ────────────────────────
+            if ! command -v docker &>/dev/null; then
+              echo "Installing Docker..."
+              curl -fsSL https://get.docker.com | sudo sh
+              sudo usermod -aG docker ubuntu
+              echo "✅ Docker installed"
+            else
+              echo "✅ Docker already installed — skipping"
+            fi
+
+            # ── Nginx + Certbot (only if not installed) ───────────────
+            if ! command -v nginx &>/dev/null; then
+              echo "Installing Nginx + Certbot..."
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq nginx certbot python3-certbot-nginx
+              echo "✅ Nginx + Certbot installed"
+            else
+              echo "✅ Nginx already installed — skipping"
+            fi
+
+            # ── App directories ───────────────────────────────────────
+            mkdir -p ~/cashflow/scripts
+            sudo mkdir -p /var/lib/cashflow-mongo /var/backups/cashflow-mongo
+            sudo chown -R 999:999 /var/lib/cashflow-mongo 2>/dev/null || true
+            sudo chown -R ubuntu:ubuntu /var/backups/cashflow-mongo
+
+            # ── Internal Docker network ───────────────────────────────
+            sudo docker network create cashflow-net 2>/dev/null || true
+
+            # ── MongoDB container (only if not running) ───────────────
+            if ! sudo docker ps --format '{{.Names}}' | grep -q cashflow-mongo; then
+              echo "Starting MongoDB container..."
+              sudo docker run -d \
+                --name cashflow-mongo \
+                --restart always \
+                --network cashflow-net \
+                -p 127.0.0.1:27017:27017 \
+                -v /var/lib/cashflow-mongo:/data/db \
+                -e MONGO_INITDB_ROOT_USERNAME=cashflowAdmin \
+                -e MONGO_INITDB_ROOT_PASSWORD=Shakayet1211879404 \
+                -e MONGO_INITDB_DATABASE=cashflow \
+                mongo:7.0 --wiredTigerCacheSizeGB 0.25
+              echo "✅ MongoDB started"
+            else
+              echo "✅ MongoDB already running — skipping"
+            fi
+
+            # ── Nginx config (write/overwrite on every push so it stays current) ──
+            sudo tee /etc/nginx/sites-available/cashflow > /dev/null << 'NGINXEOF'
+            server {
+                listen 80;
+                server_name api.mycashflowiq.com;
+
+                location / {
+                    proxy_pass http://127.0.0.1:5000;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_cache_bypass $http_upgrade;
+                }
+            }
+
+            server {
+                listen 80;
+                server_name admin.mycashflowiq.com;
+
+                location / {
+                    proxy_pass http://127.0.0.1:3001;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_cache_bypass $http_upgrade;
+                }
+            }
+            NGINXEOF
+
+            sudo ln -sf /etc/nginx/sites-available/cashflow /etc/nginx/sites-enabled/cashflow
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t && sudo systemctl enable nginx && sudo systemctl reload nginx
+            echo "✅ Nginx config applied"
+
+            # ── Daily backup script ───────────────────────────────────
+            cat > ~/cashflow/scripts/backup-db.sh << 'EOF'
+            #!/bin/bash
+            set -e
+            BACKUP_DIR="/var/backups/cashflow-mongo"
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            BACKUP_FILE="cashflow_backup_${TIMESTAMP}.gz"
+            mkdir -p "$BACKUP_DIR"
+            sudo docker exec cashflow-mongo mongodump \
+              --username cashflowAdmin \
+              --password Shakayet1211879404 \
+              --authenticationDatabase admin \
+              --db cashflow \
+              --archive --gzip > "${BACKUP_DIR}/${BACKUP_FILE}"
+            find "$BACKUP_DIR" -type f -name "cashflow_backup_*.gz" -mtime +7 -delete
+            echo "[$(date)] Backup: ${BACKUP_FILE} ($(du -h "${BACKUP_DIR}/${BACKUP_FILE}" | cut -f1))"
+            EOF
+            chmod +x ~/cashflow/scripts/backup-db.sh
+
+            # ── Restore script ────────────────────────────────────────
+            cat > ~/cashflow/scripts/restore-db.sh << 'EOF'
+            #!/bin/bash
+            set -e
+            BACKUP_FILE="$1"
+            [ -z "$BACKUP_FILE" ] && { echo "Usage: ./restore-db.sh <backup.gz>"; exit 1; }
+            sudo docker exec -i cashflow-mongo mongorestore \
+              --username cashflowAdmin \
+              --password Shakayet1211879404 \
+              --authenticationDatabase admin \
+              --drop --archive --gzip < "$BACKUP_FILE"
+            echo "✅ Database restored from: $BACKUP_FILE"
+            EOF
+            chmod +x ~/cashflow/scripts/restore-db.sh
+
+            # ── Cron job for nightly backups at 2:00 AM UTC ───────────
+            (crontab -l 2>/dev/null | grep -v "backup-db.sh"; echo "0 2 * * * /home/ubuntu/cashflow/scripts/backup-db.sh >> /var/log/cashflow-backup.log 2>&1") | crontab -
+
+            echo "✅ Server bootstrap complete!"
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 1: TypeScript type-check (runs in parallel with setup-server)
   # ─────────────────────────────────────────────────────────────────
   type-check:
     name: 🔍 Type Check
@@ -122,7 +281,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ─────────────────────────────────────────────────────────────────
-  # JOB 2c: Build Flutter APK (upload as artifact, no deploy to EC2)
+  # JOB 2c: Build Flutter APK (artifact only — no EC2 deploy)
   # ─────────────────────────────────────────────────────────────────
   build-flutter:
     name: 📱 Build Flutter APK
@@ -153,11 +312,11 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────
-  # JOB 3: Blue/Green deploy to EC2 via SSH
+  # JOB 3: Blue/Green deploy — waits for BOTH setup-server AND builds
   # ─────────────────────────────────────────────────────────────────
   deploy:
     name: 🚀 Deploy to EC2 (mycashflowiq.com)
-    needs: [build-backend, build-admin]
+    needs: [setup-server, build-backend, build-admin]
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH (Blue/Green)
@@ -167,44 +326,42 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           envs: IMAGE_BACKEND,IMAGE_ADMIN,TAG,GITHUB_TOKEN,GITHUB_ACTOR
+          command_timeout: 10m
           script: |
             set -e
             cd ~/cashflow
 
-            # ── Write env files from the single ENV_FILE secret ──────────
-            # Pipe the full .env through heredoc, then extract sections
-            cat << 'ENVEOF' > .env.raw
+            # ── Write env from single secret, split by section ────────
+            cat > .env.raw << 'ENVEOF'
             ${{ secrets.ENV_FILE }}
             ENVEOF
 
-            # Extract backend section (between backend start/end markers)
             sed -n '/backned start/,/backned end/p' .env.raw > .env.backend
-            # Fallback: if section markers not found use whole file
             [ ! -s .env.backend ] && cp .env.raw .env.backend
 
-            # Extract admin section (between admin start/end markers)
             sed -n '/admin start/,/admin end/p' .env.raw > .env.admin
             [ ! -s .env.admin ] && cp .env.raw .env.admin
 
-            # Auto-fix mongo hostname: containers use Docker network, not localhost
+            # Auto-fix: containers connect to mongo via Docker network name
             sed -i 's|@localhost:27017|@cashflow-mongo:27017|g' .env.backend
             sed -i 's|@127.0.0.1:27017|@cashflow-mongo:27017|g' .env.backend
 
-            # Secure: restrict permissions on env files
             chmod 600 .env.backend .env.admin .env.raw
 
-            # ── Login to GHCR using auto-injected GITHUB_TOKEN ───────────
-            echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+            # ── Login to GHCR ─────────────────────────────────────────
+            echo "${GITHUB_TOKEN}" | sudo docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
-            # ── Pull new images ──────────────────────────────────────────
-            docker pull ${IMAGE_BACKEND}:${TAG}
-            docker pull ${IMAGE_ADMIN}:${TAG}
+            # ── Pull new images ───────────────────────────────────────
+            sudo docker pull ${IMAGE_BACKEND}:${TAG}
+            sudo docker pull ${IMAGE_ADMIN}:${TAG}
 
-            # ── Ensure internal Docker network exists ────────────────────
-            docker network create cashflow-net 2>/dev/null || true
+            # ── Ensure internal network exists ────────────────────────
+            sudo docker network create cashflow-net 2>/dev/null || true
 
-            # ── BLUE/GREEN: Start GREEN containers on alternate ports ─────
-            docker run -d \
+            # ── GREEN: start on alternate ports ──────────────────────
+            sudo docker rm -f cashflow-backend-green cashflow-admin-green 2>/dev/null || true
+
+            sudo docker run -d \
               --name cashflow-backend-green \
               --network cashflow-net \
               --env-file .env.backend \
@@ -215,58 +372,93 @@ jobs:
               --health-start-period 20s \
               ${IMAGE_BACKEND}:${TAG}
 
-            docker run -d \
+            sudo docker run -d \
               --name cashflow-admin-green \
               --network cashflow-net \
               --env-file .env.admin \
               -p 3002:3001 \
               ${IMAGE_ADMIN}:${TAG}
 
-            # ── Wait for backend health (max 70s) ────────────────────────
-            for i in $(seq 1 14); do
-              STATUS=$(docker inspect --format='{{.State.Health.Status}}' cashflow-backend-green 2>/dev/null || echo "starting")
-              echo "⏳ Backend health: $STATUS ($i/14)"
+            # ── Wait for backend health check ─────────────────────────
+            echo "Waiting for backend to become healthy..."
+            for i in $(seq 1 18); do
+              STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' cashflow-backend-green 2>/dev/null || echo "starting")
+              echo "  Health: $STATUS ($i/18)"
               [ "$STATUS" = "healthy" ] && break
-              [ $i -eq 14 ] && {
-                echo "❌ Health check failed. Rolling back."
-                docker rm -f cashflow-backend-green cashflow-admin-green 2>/dev/null || true
+              [ $i -eq 18 ] && {
+                echo "❌ Backend failed health check. Rolling back."
+                sudo docker rm -f cashflow-backend-green cashflow-admin-green 2>/dev/null || true
                 exit 1
               }
               sleep 5
             done
-            echo "✅ Backend healthy — switching Nginx to green"
+            echo "✅ Backend healthy!"
 
-            # ── Switch Nginx traffic to green ports ──────────────────────
+            # ── Switch Nginx to green ─────────────────────────────────
             sudo sed -i 's|proxy_pass http://127.0.0.1:5000|proxy_pass http://127.0.0.1:5001|' /etc/nginx/sites-available/cashflow
             sudo sed -i 's|proxy_pass http://127.0.0.1:3001|proxy_pass http://127.0.0.1:3002|' /etc/nginx/sites-available/cashflow
             sudo nginx -t && sudo systemctl reload nginx
+            echo "✅ Nginx switched to green"
 
-            # ── Kill old BLUE containers ─────────────────────────────────
-            docker rm -f cashflow-backend-blue cashflow-admin-blue 2>/dev/null || true
+            # ── Kill old blue containers ──────────────────────────────
+            sudo docker rm -f cashflow-backend-blue cashflow-admin-blue 2>/dev/null || true
 
-            # ── Restart GREEN on production ports (blue slot) ────────────
-            docker stop cashflow-backend-green && docker rm cashflow-backend-green
-            docker stop cashflow-admin-green   && docker rm cashflow-admin-green
+            # ── Promote green → blue (production ports) ───────────────
+            sudo docker stop cashflow-backend-green && sudo docker rm cashflow-backend-green
+            sudo docker stop cashflow-admin-green   && sudo docker rm cashflow-admin-green
 
-            docker run -d --name cashflow-backend-blue --restart unless-stopped \
+            sudo docker run -d --name cashflow-backend-blue --restart unless-stopped \
               --network cashflow-net \
               --env-file .env.backend \
               -p 5000:5000 \
               ${IMAGE_BACKEND}:${TAG}
 
-            docker run -d --name cashflow-admin-blue --restart unless-stopped \
+            sudo docker run -d --name cashflow-admin-blue --restart unless-stopped \
               --network cashflow-net \
               --env-file .env.admin \
               -p 3001:3001 \
               ${IMAGE_ADMIN}:${TAG}
 
-            # ── Reset Nginx ports back to production ─────────────────────
+            # ── Reset Nginx ports back to production ──────────────────
             sudo sed -i 's|proxy_pass http://127.0.0.1:5001|proxy_pass http://127.0.0.1:5000|' /etc/nginx/sites-available/cashflow
             sudo sed -i 's|proxy_pass http://127.0.0.1:3002|proxy_pass http://127.0.0.1:3001|' /etc/nginx/sites-available/cashflow
             sudo nginx -t && sudo systemctl reload nginx
 
-            # ── Cleanup old images (save disk space) ─────────────────────
-            docker image prune -f --filter "until=24h"
+            # ── Cleanup old images ────────────────────────────────────
+            sudo docker image prune -f --filter "until=24h"
             rm -f .env.raw
 
             echo "✅ Deploy complete — ${TAG}"
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 4: SSL — runs after deploy, idempotent (safe to run every push)
+  # Installs free HTTPS via Let's Encrypt. Skips if cert already exists.
+  # ─────────────────────────────────────────────────────────────────
+  ssl-setup:
+    name: 🔒 SSL Setup (Let's Encrypt)
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Issue or renew SSL via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Check if cert already exists and is valid
+            if sudo certbot certificates 2>/dev/null | grep -q "api.mycashflowiq.com"; then
+              echo "✅ SSL certificate already exists — skipping issuance"
+              # Attempt renewal if close to expiry (safe, no-op if not needed)
+              sudo certbot renew --quiet --no-self-upgrade 2>/dev/null || true
+            else
+              echo "Issuing Let's Encrypt SSL certificates..."
+              sudo certbot --nginx \
+                -d api.mycashflowiq.com \
+                -d admin.mycashflowiq.com \
+                --non-interactive \
+                --agree-tos \
+                -m shakayet.dev@gmail.com \
+                --redirect
+              echo "✅ SSL certificates issued — HTTPS is now live!"
+            fi
