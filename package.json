@@ -1,0 +1,40 @@
+{
+  "name": "cashflow-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "start": "turbo run start",
+    "lint": "turbo run lint",
+    "lint:fix": "turbo run lint:fix",
+    "test": "turbo run test",
+    "clean": "turbo run clean",
+
+    "backend": "turbo run dev --filter=cashflow-backend",
+    "admin": "turbo run dev --filter=cash-flowiq-app",
+    "mobile": "turbo run dev --filter=cashflow-mobile",
+
+    "install:all": "npm install && cd apps/mobile && flutter pub get"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0"
+  },
+  "engines": {
+    "node": ">=20 <25",
+    "npm": ">=10"
+  },
+  "packageManager": "npm@10.9.0",
+  "allowScripts": {
+    "bcrypt@6.0.0": true,
+    "sharp@0.35.4": true,
+    "@parcel/watcher": true,
+    "tesseract.js": false,
+    "unrs-resolver": false,
+    "msw": false
+  }
+}

@@ -1,0 +1,24 @@
+# Turborepo Setup Tasks
+
+- [x] Read skills & analyse project structure
+- [x] Read root `.env` — understand all services
+- [x] Create implementation plan
+- [x] Create root `package.json` (workspace root)
+- [x] Create `apps/` directory structure (Option B)
+  - [x] Move `Cashflow-Backend` → `apps/backend`
+  - [x] Move `cash-flow` → `apps/admin`
+  - [x] Move `cashflow_app` → `apps/mobile`
+- [x] Create `turbo.json` (pipeline config)
+- [x] Create `apps/mobile/package.json` (Flutter shim)
+- [x] Fix admin `dev` script to run on port 3001
+- [x] Update root `.env` (fill app/admin sections)
+- [x] Create `.env.example` (safe template)
+- [x] Create root `.gitignore`
+- [x] Create `packages/config/tsconfig/base.json`
+- [x] Create `packages/config/package.json`
+- [x] Create root `README.md`
+- [x] Run `npm install` at root (1432 packages, exit 0)
+- [x] Verify workspace linking (`npm ls --workspaces`) — all 4 linked ✅
+- [x] Fix `allowScripts` warning → moved to root package.json
+- [x] Turbo dry-run — all 4 pipelines resolve correctly ✅
+- [x] Create walkthrough summary
