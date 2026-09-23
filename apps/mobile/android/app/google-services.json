@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "124553852455",
+    "project_id": "cashflowiq-6ac48",
+    "storage_bucket": "cashflowiq-6ac48.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:124553852455:android:8f5fb34ea794dd6f68c002",
+        "android_client_info": {
+          "package_name": "com.cashflowIQ.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDVEA43L_AfXDP753b5I9pl7azfAJRFC8M"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

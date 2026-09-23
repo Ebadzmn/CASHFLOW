@@ -1,0 +1,272 @@
+name: CashFlow CI/CD
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BACKEND: ghcr.io/ebadzmn/cashflow-backend
+  IMAGE_ADMIN: ghcr.io/ebadzmn/cashflow-admin
+  TAG: ${{ github.sha }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 1: TypeScript type-check (both apps in parallel)
+  # ─────────────────────────────────────────────────────────────────
+  type-check:
+    name: 🔍 Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Install backend deps
+        run: npm ci
+        working-directory: apps/backend
+
+      - name: Install admin deps
+        run: npm ci
+        working-directory: apps/admin
+
+      - name: Type-check backend
+        run: npx tsc --noEmit
+        working-directory: apps/backend
+
+      - name: Type-check admin
+        run: npx tsc --noEmit
+        working-directory: apps/admin
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 2a: Build & push Backend Docker image to GHCR
+  # ─────────────────────────────────────────────────────────────────
+  build-backend:
+    name: 🏗️ Build Backend
+    needs: type-check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push Backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/backend
+          push: true
+          tags: |
+            ${{ env.IMAGE_BACKEND }}:${{ env.TAG }}
+            ${{ env.IMAGE_BACKEND }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 2b: Build & push Admin Docker image to GHCR
+  # ─────────────────────────────────────────────────────────────────
+  build-admin:
+    name: 🏗️ Build Admin
+    needs: type-check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push Admin
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/admin
+          push: true
+          tags: |
+            ${{ env.IMAGE_ADMIN }}:${{ env.TAG }}
+            ${{ env.IMAGE_ADMIN }}:latest
+          build-args: |
+            NEXT_PUBLIC_BASE_URL=https://api.mycashflowiq.com/api/v1
+            NEXT_PUBLIC_API_URL=https://api.mycashflowiq.com/api/v1
+            NEXT_PUBLIC_SOCKET_URL=https://api.mycashflowiq.com
+            NEXTAUTH_URL=https://admin.mycashflowiq.com
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 2c: Build Flutter APK (upload as artifact, no deploy to EC2)
+  # ─────────────────────────────────────────────────────────────────
+  build-flutter:
+    name: 📱 Build Flutter APK
+    needs: type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.x'
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: apps/mobile
+        run: flutter pub get
+
+      - name: Build APK (release)
+        working-directory: apps/mobile
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cashflow-apk-${{ env.TAG }}
+          path: apps/mobile/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 3: Blue/Green deploy to EC2 via SSH
+  # ─────────────────────────────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to EC2 (mycashflowiq.com)
+    needs: [build-backend, build-admin]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH (Blue/Green)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_BACKEND,IMAGE_ADMIN,TAG,GITHUB_TOKEN,GITHUB_ACTOR
+          script: |
+            set -e
+            cd ~/cashflow
+
+            # ── Write env files from the single ENV_FILE secret ──────────
+            # Pipe the full .env through heredoc, then extract sections
+            cat << 'ENVEOF' > .env.raw
+            ${{ secrets.ENV_FILE }}
+            ENVEOF
+
+            # Extract backend section (between backend start/end markers)
+            sed -n '/backned start/,/backned end/p' .env.raw > .env.backend
+            # Fallback: if section markers not found use whole file
+            [ ! -s .env.backend ] && cp .env.raw .env.backend
+
+            # Extract admin section (between admin start/end markers)
+            sed -n '/admin start/,/admin end/p' .env.raw > .env.admin
+            [ ! -s .env.admin ] && cp .env.raw .env.admin
+
+            # Auto-fix mongo hostname: containers use Docker network, not localhost
+            sed -i 's|@localhost:27017|@cashflow-mongo:27017|g' .env.backend
+            sed -i 's|@127.0.0.1:27017|@cashflow-mongo:27017|g' .env.backend
+
+            # Secure: restrict permissions on env files
+            chmod 600 .env.backend .env.admin .env.raw
+
+            # ── Login to GHCR using auto-injected GITHUB_TOKEN ───────────
+            echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+            # ── Pull new images ──────────────────────────────────────────
+            docker pull ${IMAGE_BACKEND}:${TAG}
+            docker pull ${IMAGE_ADMIN}:${TAG}
+
+            # ── Ensure internal Docker network exists ────────────────────
+            docker network create cashflow-net 2>/dev/null || true
+
+            # ── BLUE/GREEN: Start GREEN containers on alternate ports ─────
+            docker run -d \
+              --name cashflow-backend-green \
+              --network cashflow-net \
+              --env-file .env.backend \
+              -p 5001:5000 \
+              --health-cmd 'node -e "fetch(\"http://127.0.0.1:5000/health/live\").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"' \
+              --health-interval 10s \
+              --health-retries 6 \
+              --health-start-period 20s \
+              ${IMAGE_BACKEND}:${TAG}
+
+            docker run -d \
+              --name cashflow-admin-green \
+              --network cashflow-net \
+              --env-file .env.admin \
+              -p 3002:3001 \
+              ${IMAGE_ADMIN}:${TAG}
+
+            # ── Wait for backend health (max 70s) ────────────────────────
+            for i in $(seq 1 14); do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' cashflow-backend-green 2>/dev/null || echo "starting")
+              echo "⏳ Backend health: $STATUS ($i/14)"
+              [ "$STATUS" = "healthy" ] && break
+              [ $i -eq 14 ] && {
+                echo "❌ Health check failed. Rolling back."
+                docker rm -f cashflow-backend-green cashflow-admin-green 2>/dev/null || true
+                exit 1
+              }
+              sleep 5
+            done
+            echo "✅ Backend healthy — switching Nginx to green"
+
+            # ── Switch Nginx traffic to green ports ──────────────────────
+            sudo sed -i 's|proxy_pass http://127.0.0.1:5000|proxy_pass http://127.0.0.1:5001|' /etc/nginx/sites-available/cashflow
+            sudo sed -i 's|proxy_pass http://127.0.0.1:3001|proxy_pass http://127.0.0.1:3002|' /etc/nginx/sites-available/cashflow
+            sudo nginx -t && sudo systemctl reload nginx
+
+            # ── Kill old BLUE containers ─────────────────────────────────
+            docker rm -f cashflow-backend-blue cashflow-admin-blue 2>/dev/null || true
+
+            # ── Restart GREEN on production ports (blue slot) ────────────
+            docker stop cashflow-backend-green && docker rm cashflow-backend-green
+            docker stop cashflow-admin-green   && docker rm cashflow-admin-green
+
+            docker run -d --name cashflow-backend-blue --restart unless-stopped \
+              --network cashflow-net \
+              --env-file .env.backend \
+              -p 5000:5000 \
+              ${IMAGE_BACKEND}:${TAG}
+
+            docker run -d --name cashflow-admin-blue --restart unless-stopped \
+              --network cashflow-net \
+              --env-file .env.admin \
+              -p 3001:3001 \
+              ${IMAGE_ADMIN}:${TAG}
+
+            # ── Reset Nginx ports back to production ─────────────────────
+            sudo sed -i 's|proxy_pass http://127.0.0.1:5001|proxy_pass http://127.0.0.1:5000|' /etc/nginx/sites-available/cashflow
+            sudo sed -i 's|proxy_pass http://127.0.0.1:3002|proxy_pass http://127.0.0.1:3001|' /etc/nginx/sites-available/cashflow
+            sudo nginx -t && sudo systemctl reload nginx
+
+            # ── Cleanup old images (save disk space) ─────────────────────
+            docker image prune -f --filter "until=24h"
+            rm -f .env.raw
+
+            echo "✅ Deploy complete — ${TAG}"

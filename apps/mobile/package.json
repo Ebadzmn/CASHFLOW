@@ -1,0 +1,16 @@
+{
+  "name": "cashflow-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CashFlow Flutter mobile app (iOS & Android)",
+  "scripts": {
+    "dev": "flutter run",
+    "build": "flutter build apk --release",
+    "build:ios": "flutter build ipa --release",
+    "start": "flutter run --release",
+    "clean": "flutter clean",
+    "deps": "flutter pub get",
+    "lint": "flutter analyze",
+    "test": "flutter test"
+  }
+}

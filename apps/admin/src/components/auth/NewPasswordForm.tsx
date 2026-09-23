@@ -1,0 +1,149 @@
+"use client";
+// import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Eye, EyeOff } from "lucide-react";
+
+import Cookies from "js-cookie";
+import axios from "axios";
+import axiosSecure from "@/components/hook/axiosSecure";
+
+export default function NewPasswordForm() {
+  // const router = useRouter();
+  const [loading, setLoading] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setLoading(true);
+    setError("");
+    setMessage("");
+
+    if (newPassword !== confirmPassword) {
+      setError("Passwords do not match.");
+      setLoading(false);
+      return;
+    }
+
+    const email = localStorage.getItem("reset_email");
+    const otp = localStorage.getItem("reset_otp");
+    const token = localStorage.getItem("reset_token") || Cookies.get("token");
+
+    if (!email) {
+      setError("Session expired. Please start over.");
+      setLoading(false);
+      return;
+    }
+
+    if (token) {
+      Cookies.set("token", token, { expires: 1 });
+    }
+
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    try {
+      const response = await axiosSecure.post(
+        "/auth/reset-password",
+        { 
+          email, 
+          otp, 
+          newPassword,
+          confirmPassword,
+        },
+        { headers }
+      );
+
+      if (response.data?.success || response.status === 200) {
+        setMessage(response.data?.message || "Password reset successfully.");
+        localStorage.removeItem("reset_email");
+        localStorage.removeItem("reset_otp");
+        localStorage.removeItem("reset_token");
+        Cookies.remove("token");
+        // Temporarily disabled redirect to login
+        // setTimeout(() => {
+        //   router.push("/login");
+        // }, 1500);
+      } else {
+        setError("Failed to reset password.");
+      }
+    } catch (err: unknown) {
+      let msg = "An error occurred.";
+      if (axios.isAxiosError(err) && err.response?.data?.message) {
+        msg = err.response.data.message;
+      } else if (err instanceof Error) {
+        msg = err.message;
+      }
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="w-full">
+      <div className="text-center mb-10">
+        <h1 className="text-3xl font-bold mb-2 text-white">Set New Password</h1>
+        <p className="text-white/50">Create a new secure password for your account</p>
+      </div>
+      <form onSubmit={onSubmit} className="space-y-6">
+        <div className="space-y-2 text-left">
+          <label className="text-sm font-medium text-white/70">New Password</label>
+          <div className="relative">
+            <Input
+              type={showNewPassword ? "text" : "password"}
+              required
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="••••••••"
+              className="h-12 bg-white/5 border-white/5 text-white placeholder:text-white/20 focus-visible:ring-blue-500/50 pr-12"
+            />
+            <button
+              type="button"
+              onClick={() => setShowNewPassword(!showNewPassword)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 hover:text-white transition-colors"
+            >
+              {showNewPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+            </button>
+          </div>
+        </div>
+        <div className="space-y-2 text-left">
+          <label className="text-sm font-medium text-white/70">Confirm Password</label>
+          <div className="relative">
+            <Input
+              type={showConfirmPassword ? "text" : "password"}
+              required
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              placeholder="••••••••"
+              className="h-12 bg-white/5 border-white/5 text-white placeholder:text-white/20 focus-visible:ring-blue-500/50 pr-12"
+            />
+            <button
+              type="button"
+              onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 hover:text-white transition-colors"
+            >
+              {showConfirmPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+            </button>
+          </div>
+        </div>
+
+        {error && <div className="text-red-500 text-sm mt-2">{error}</div>}
+        {message && <div className="text-green-500 text-sm mt-2">{message}</div>}
+        <Button variant="premium" type="submit" className="w-full h-12 text-base" disabled={loading}>
+          {loading ? "Saving..." : "Set New Password"}
+        </Button>
+      </form>
+    </div>
+  );
+}
+
